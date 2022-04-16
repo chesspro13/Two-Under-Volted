@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Arduino.h>
 
 #define FEET_PER_REVOLUTION 6.9
 #define MILE 5280
@@ -11,6 +12,12 @@
 #define OLED_RESET     4 // Reset pin # (or -1 if sharing Arduino reset pin)
 #define SCREEN_ADDRESS 0x3C ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define THROTTLE_OUTPUT 25 // Pin 25 is a DAC output
+#define BREAK_INPUT 31 // Pin will be low until the breaks are pulled, then pulled high
+#define BREAK_OUTPUT 33
+#define DRIVE_MODE_BUTTON 32
+#define DRIVE_PAUSE 23
 
 // SPEED SENSOR===================================================================================================================
 // Data
@@ -33,6 +40,7 @@ long lastInturrupt;
 double timeSinceLastTick = 0;
 double refreshRate = 0.25;
 long lastRefresh;
+long debounceTime;
 
 
 // Display Data
@@ -47,6 +55,24 @@ short seconds;
 int miles;
 short partial;
 
+// Drive
+bool canDrive;
+volatile bool changedDriveMode;
+volatile bool isBreaking;
+volatile bool isDrivePaused;
+long drivingChange = -1;
+byte driveMode;
+byte driveModeChange;
+long modeChangeDelay = 2000;
+long timeToChangeMode = -1;
+  /* Drive Modes:
+      * 0: No drive
+      * 1: 15MPH Max
+      * 2: Full Drive
+      * 3: Analog
+      */
+
+//=====================================================================================================CODE=====================================================================================================
 
 void setup() {
   Serial.begin(9600);
@@ -59,10 +85,45 @@ void setup() {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;); // Don't proceed, loop forever
   }
+
+    // Set driving to off by default. Can be changed later with the drive mode button
+  canDrive = true;
+
+changeDrivingMode(0);
+  pinMode(DRIVE_MODE_BUTTON, INPUT_PULLUP);
+  pinMode(BREAK_INPUT, INPUT_PULLUP);
+  pinMode(DRIVE_PAUSE, INPUT);
+  attachInterrupt(digitalPinToInterrupt(DRIVE_MODE_BUTTON), changeDrivingModeInturrupt, RISING);
+  attachInterrupt(digitalPinToInterrupt(BREAK_INPUT), breaking, HIGH);
+  attachInterrupt(digitalPinToInterrupt(DRIVE_PAUSE), pauseDrive, FALLING);
+  delay(1000);
+  changedDriveMode = false;
+}
+
+void changeDrivingModeInturrupt()
+{
+  changedDriveMode = true;
+}
+
+void breaking()
+{
+  isBreaking = true;
+}
+
+void pauseDrive()
+{
+  if( millis() > debounceTime )
+  {
+    Serial.println("Pause Button Presseed");
+    Serial.println(String(isDrivePaused)+" "+String(!isDrivePaused));
+    isDrivePaused = !isDrivePaused;
+    debounceTime = millis() + 300;
+  }
+  //Serial.println("Drive Paused: " + String(isDrivePaused));
 }
 
 void loop() {
-
+  
 	// Get current time in millis for time calculations.
 	// 	Used to determin if it is time to update display, take reading
   now = millis();
@@ -94,9 +155,80 @@ void loop() {
     takeReading = false;
   }
 
+  if( isBreaking )
+  {
+    Serial.println("Breaking, stopping motor");
+    isDrivePaused = true;
+  }
+
+  if( isDrivePaused )
+  {
+    if(canDrive)
+    {
+      canDrive = false;
+      dacWrite(THROTTLE_OUTPUT, 0);
+      Serial.println("Pausing ride");
+    }
+  }else
+  {
+    if( timeToChangeMode < 0 )
+    if( !canDrive )
+    {
+      canDrive = true;
+      Serial.println("Ride no longer paused");
+      changeDrivingMode(driveModeChange);
+    }
+  }
+
+  if( timeToChangeMode > 0 )
+  if( now > timeToChangeMode )
+  {
+    Serial.println("Applying new driving mode");
+    changeDrivingMode( driveModeChange );
+    timeToChangeMode = -1;
+  }
+
+  if( changedDriveMode )
+  {
+    if( now > drivingChange)
+    {
+      Serial.println("Changing drive mode set");
+      changedDriveMode = false;
+      driveModeChange += 1;
+      if( driveModeChange >= 3 )
+        driveModeChange = 0;
+      timeToChangeMode = now + modeChangeDelay;
+
+      Serial.println("Current drive mode: " + String(driveModeChange));
+
+    }
+  }
+
   printToOled();
 }
 
+void changeDrivingMode(byte newDriveMode)
+{
+  driveMode = newDriveMode;
+//if (canDrive)
+  switch(driveMode)
+  {
+    case 0:
+      dacWrite( THROTTLE_OUTPUT, 0 );
+      Serial.println("New driving mode: NONE");
+      break;
+    case 1:
+      dacWrite( THROTTLE_OUTPUT, 255/2 );
+      Serial.println("New driving mode: 15MPH");
+      break;
+    case 2:
+      dacWrite( THROTTLE_OUTPUT, 255 );
+      Serial.println("New driving mode: FULL OPEN");
+      break;
+
+  }
+  Serial.println("New driving mode: " + String(driveMode));
+}
 
 void record()
 {
@@ -194,6 +326,7 @@ void printToOled() {
     display.println("0" + String(minutes));
   else
     display.println(String(minutes));
+
     // COLON
   display.drawRect(101, 54, 2, 2, SSD1306_WHITE);
   display.drawRect(101, 58, 2, 2, SSD1306_WHITE);
